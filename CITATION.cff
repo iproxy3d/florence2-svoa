@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use Florence-2 SVOA, please cite this repository."
+title: "Florence-2 SVOA: Structured Visual Event Extraction"
+type: software
+authors:
+  - family-names: "Zelenskiy"
+    given-names: "Ilya"
+repository-code: "https://github.com/iproxy3d/florence2-svoa"
+license: MIT
+version: 0.1.0
+date-released: 2026-11-04

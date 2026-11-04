@@ -1,0 +1,19 @@
+{
+  "base_model": "microsoft/Florence-2-base-ft",
+  "task_prompt": "Extract the main event or communicative gesture as subject|action|object|adjuncts:",
+  "image_size": 768,
+  "seed": 17,
+  "best_epoch": 8,
+  "best_validation_loss": 0.45876,
+  "test_metrics": {
+    "examples": 2231,
+    "exact_match": 0.2765575974899148,
+    "valid_format": 0.9950694755714926,
+    "field_accuracy": {
+      "subject": 0.7767817122366651,
+      "action": 0.63334827431645,
+      "object": 0.6364858807709547,
+      "adjuncts": 0.5701479157328552
+    }
+  }
+}

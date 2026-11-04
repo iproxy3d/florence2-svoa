@@ -1,0 +1,9 @@
+{
+  "image": "example.jpg",
+  "prediction": "man|smile|none|skatepark",
+  "subject": "man",
+  "action": "smile",
+  "object": "none",
+  "adjuncts": "skatepark",
+  "valid_format": true
+}
