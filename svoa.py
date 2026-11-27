@@ -158,7 +158,21 @@ def command_download(args: argparse.Namespace, extra: Sequence[str]) -> None:
         ],
     )
     download_swig_annotations(output_dir, args.request_timeout)
-    print("\nDownload completed")
+    report_path = output_dir / "source_status.json"
+    if report_path.is_file():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        incomplete = [
+            item for item in report.get("sources", [])
+            if item.get("downloaded", 0) < item.get("target", 0)
+        ]
+        if incomplete:
+            names = ", ".join(item["dataset"] for item in incomplete)
+            print(f"\nDownload finished with incomplete sources: {names}")
+            print(f"Details: {report_path}")
+        else:
+            print("\nDownload completed")
+    else:
+        print("\nDownload subprocess finished without source_status.json")
     print(f"manifest: {output_dir / 'manifest.jsonl'}")
     print(f"SWiG annotations: {output_dir / 'swig_annotations' / 'SWiG_jsons'}")
     print(f"HaGRID annotations: {output_dir / 'hagrid_annotations'}")

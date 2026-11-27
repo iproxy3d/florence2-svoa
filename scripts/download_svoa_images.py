@@ -13,7 +13,8 @@ are handled in one of two ways:
 
 * individual images are requested by URL/ID (GQA, Open Images, Mutual Gaze);
 * selected members are read from a remote ZIP with HTTP Range requests
-  (SWiG, EasyPortrait, WIDER FACE, HaGRIDv2).
+  (SWiG, EasyPortrait, WIDER FACE, HaGRIDv2). ZIP members are processed
+  in physical order or shuffled in contiguous blocks instead of per file.
 
 If selective access is unavailable, the dataset directory is still created
 and receives ``_PLACE_IMAGES_HERE.txt``. Images can be copied there manually
@@ -293,6 +294,14 @@ class StateDB:
         )
         return {Path(str(row["local_path"])).resolve() for row in rows}
 
+    def failed_count(self, dataset: str) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM downloads "
+            "WHERE dataset = ? AND status = 'failed'",
+            (dataset,),
+        ).fetchone()
+        return int(row["count"])
+
     def get_offset(self, dataset: str) -> int:
         row = self.connection.execute(
             "SELECT value FROM metadata WHERE key = ?",
@@ -303,7 +312,8 @@ class StateDB:
     def set_offset(self, dataset: str, value: int) -> None:
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+            "WHERE CAST(excluded.value AS INTEGER) > CAST(metadata.value AS INTEGER)",
             (f"{dataset}.next_offset", str(value)),
         )
         self.connection.commit()
@@ -546,15 +556,105 @@ def fetch_remote_image(url: str, timeout: float, attempts: int = 3) -> Image.Ima
     raise RuntimeError(f"cannot download image after {attempts} attempts")
 
 
-def shuffled_image_members(names: Iterable[str], seed: int) -> list[str]:
+def ordered_image_members(
+    infos: Iterable[zipfile.ZipInfo], seed: int, block_size: int
+) -> list[zipfile.ZipInfo]:
+    """Visit neighboring ZIP entries together, optionally shuffle whole blocks.
+
+    Each entry is ordered by its physical ZIP header offset, which may differ
+    from the listing order. A block size of 0 disables all shuffling.
+    """
     images = [
-        name
-        for name in names
-        if not name.endswith("/") and Path(name).suffix.lower() in IMAGE_SUFFIXES
+        info for info in infos
+        if not info.filename.endswith("/")
+        and Path(info.filename).suffix.lower() in IMAGE_SUFFIXES
     ]
-    randomizer = random.Random(seed)
-    randomizer.shuffle(images)
-    return images
+    images.sort(key=lambda info: (info.header_offset, info.filename))
+    if block_size <= 0:
+        return images
+    blocks = [
+        images[index:index + block_size]
+        for index in range(0, len(images), block_size)
+    ]
+    random.Random(seed).shuffle(blocks)
+    return [info for block in blocks for info in block]
+
+
+def retrying_zip_session():
+    """Give RemoteZip HTTP retries for 429, 5xx and transient connections."""
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    policy = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.headers.update(request_headers("application/zip"))
+    adapter = HTTPAdapter(max_retries=policy, pool_connections=1, pool_maxsize=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def retryable_zip_error(exc: Exception) -> bool:
+    """Avoid repeatedly requesting bad images and permanently missing URLs."""
+    if isinstance(exc, (ValueError, Image.UnidentifiedImageError)):
+        return False
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return status in (408, 429) or 500 <= status <= 599
+    description = str(exc).lower()
+    if any(token in description for token in (
+        "range not supported", "range requests", "http 403", "http 404",
+        "403 client error", "404 client error",
+    )):
+        return False
+    return True
+
+
+def open_remote_archive(
+    archive_url: str, timeout: float, attempts: int = 3
+):
+    """Return a RemoteZip and its owning HTTP session; retry initial probes."""
+    try:
+        from remotezip import RemoteZip
+    except ImportError as exc:
+        raise RuntimeError(
+            'missing dependency: install it with remotezip>=0.12'
+        ) from exc
+
+    for attempt in range(attempts):
+        session = retrying_zip_session()
+        try:
+            archive = RemoteZip(
+                archive_url, session=session, timeout=timeout,
+                initial_buffer_size=1024 * 1024,
+            )
+            return archive, session
+        except Exception as exc:
+            session.close()
+            if attempt + 1 >= attempts or not retryable_zip_error(exc):
+                raise
+            time.sleep(retry_delay(attempt))
+    raise RuntimeError(f"cannot open ZIP archive {archive_url}")
+
+
+def close_remote_archive(archive, session) -> None:
+    try:
+        if archive is not None:
+            archive.close()
+    finally:
+        if session is not None:
+            session.close()
 
 
 def download_remote_zip(
@@ -565,59 +665,88 @@ def download_remote_zip(
     seed: int,
     archive_url: str,
     max_errors: int,
+    *,
+    timeout: float = 60.0,
+    shuffle_block_size: int = 256,
+    member_retries: int = 3,
+    max_consecutive_errors: int = 15,
+    image_prefix: str = "",
+    initial_count: int | None = None,
+    known: set[str] | None = None,
 ) -> None:
-    if db.success_count(dataset) >= target:
-        print(f"{dataset}: target already reached ({target})")
+    """Download ZIP members with bounded remote seeks and resilient retries."""
+    count = db.success_count(dataset) if initial_count is None else initial_count
+    if count >= target:
+        print(f"{dataset}/{image_prefix}: target already reached ({target})")
         return
-    try:
-        from remotezip import RemoteZip
-    except ImportError as exc:
-        raise RuntimeError(
-            'missing dependency: install it with `python -m pip install "remotezip>=0.12"`'
-        ) from exc
+    if known is None:
+        known = db.successful_ids(dataset)
 
-    known = db.successful_ids(dataset)
+    archive, session = open_remote_archive(archive_url, timeout)
     errors = 0
-    archive = RemoteZip(archive_url)
+    consecutive_errors = 0
     try:
-        members = shuffled_image_members(
-            (info.filename for info in archive.infolist()),
-            dataset_seed(seed, dataset),
+        members = ordered_image_members(
+            archive.infolist(), seed, shuffle_block_size,
         )
         if not members:
             raise RuntimeError("remote ZIP contains no supported image files")
         for member in members:
-            image_id = member
+            image_id = f"{image_prefix}{member.filename}"
             if image_id in known:
                 continue
-            source_ref = f"{archive_url}#{member}"
-            try:
-                with archive.open(member) as source:
-                    image = Image.open(BytesIO(source.read()))
-                    item = save_image(
-                        image, dataset, image_id, source_ref, output_dir
+            source_ref = f"{archive_url}#{member.filename}"
+            last_error = None
+
+            for attempt in range(member_retries + 1):
+                try:
+                    with archive.open(member.filename) as source:
+                        with Image.open(BytesIO(source.read())) as image:
+                            item = save_image(
+                                image, dataset, image_id, source_ref, output_dir
+                            )
+                    db.record_success(item)
+                    known.add(image_id)
+                    count += 1
+                    consecutive_errors = 0
+                    print(f"{dataset}: {count}/{target} {image_id}")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= member_retries or not retryable_zip_error(exc):
+                        break
+                    print(
+                        f"{dataset}: retry {attempt + 1}/{member_retries} "
+                        f"{image_id}: {exc}", file=sys.stderr,
                     )
-                db.record_success(item)
-                known.add(image_id)
-                print(f"{dataset}: {db.success_count(dataset)}/{target} {member}")
-            except Exception as exc:
-                db.record_failure(dataset, image_id, source_ref, exc)
+                    time.sleep(retry_delay(attempt))
+                    close_remote_archive(archive, session)
+                    archive, session = None, None
+                    archive, session = open_remote_archive(archive_url, timeout)
+
+            if last_error is not None and image_id not in known:
+                db.record_failure(dataset, image_id, source_ref, last_error)
                 errors += 1
-                print(f"{dataset}: skipped {member}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
+                consecutive_errors += 1
+                print(
+                    f"{dataset}: skipped {image_id}: {last_error}",
+                    file=sys.stderr,
+                )
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                     raise RuntimeError(
-                        f"{dataset}: maximum error count reached"
-                    ) from exc
-            if db.success_count(dataset) >= target:
+                        f"{dataset}: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
+                    ) from last_error
+
+            if count >= target:
                 return
     finally:
-        archive.close()
+        close_remote_archive(archive, session)
 
     raise RuntimeError(
         f"{dataset}: archive ended before target {target}; "
-        f"only {db.success_count(dataset)} images are available locally"
+        f"only {count} images are available locally"
     )
-
 
 def hagrid_success_count(db: StateDB, gesture: str) -> int:
     """Return the number of downloaded HaGRID images for one gesture."""
@@ -660,78 +789,45 @@ def download_hagrid(
     db: StateDB,
     output_dir: Path,
 ) -> None:
-    """Download an equal, resumable sample from selected HaGRID classes."""
-
-    try:
-        from remotezip import RemoteZip
-    except ImportError as exc:
-        raise RuntimeError(
-            'missing dependency: install it with `python -m pip install '
-            '"remotezip>=0.12"`'
-        ) from exc
-
+    """Download each HaGRID class independently; one failed class cannot stop others."""
     target = args.hagrid_limit_per_gesture or args.limit_per_dataset
     known = db.successful_ids("hagrid")
+    failures: list[str] = []
     for gesture in args.hagrid_gestures:
         current = hagrid_success_count(db, gesture)
         if current >= target:
             print(f"hagrid/{gesture}: target already reached ({target})")
             continue
-
         archive_url = hagrid_archive_url(args, gesture)
-        errors = 0
-        archive = RemoteZip(archive_url)
         try:
-            members = shuffled_image_members(
-                (info.filename for info in archive.infolist()),
+            download_remote_zip(
+                "hagrid",
+                db,
+                output_dir,
+                target,
                 dataset_seed(args.seed, f"hagrid/{gesture}"),
+                archive_url,
+                args.max_errors,
+                timeout=args.request_timeout,
+                shuffle_block_size=args.archive_shuffle_block_size,
+                member_retries=args.archive_member_retries,
+                max_consecutive_errors=args.max_consecutive_errors,
+                image_prefix=f"{gesture}/",
+                initial_count=current,
+                known=known,
             )
-            if not members:
-                raise RuntimeError(
-                    f"HaGRID archive {gesture!r} contains no supported images"
-                )
-            for member in members:
-                image_id = f"{gesture}/{member}"
-                if image_id in known:
-                    continue
-                source_ref = f"{archive_url}#{member}"
-                try:
-                    with archive.open(member) as source:
-                        image = Image.open(BytesIO(source.read()))
-                        item = save_image(
-                            image,
-                            "hagrid",
-                            image_id,
-                            source_ref,
-                            output_dir,
-                        )
-                    db.record_success(item)
-                    known.add(image_id)
-                    current = hagrid_success_count(db, gesture)
-                    print(f"hagrid/{gesture}: {current}/{target} {member}")
-                except Exception as exc:
-                    db.record_failure("hagrid", image_id, source_ref, exc)
-                    errors += 1
-                    print(
-                        f"hagrid/{gesture}: skipped {member}: {exc}",
-                        file=sys.stderr,
-                    )
-                    if errors >= args.max_errors:
-                        raise RuntimeError(
-                            f"hagrid/{gesture}: maximum error count reached"
-                        ) from exc
-                if hagrid_success_count(db, gesture) >= target:
-                    break
-        finally:
-            archive.close()
-
-        current = hagrid_success_count(db, gesture)
-        if current < target:
-            raise RuntimeError(
-                f"hagrid/{gesture}: archive ended before target {target}; "
-                f"only {current} images are available locally"
+        except Exception as exc:
+            detail = f"{gesture}: {type(exc).__name__}: {exc}"
+            failures.append(detail)
+            print(
+                f"hagrid: incomplete {detail}; continuing with next class",
+                file=sys.stderr,
             )
-
+    if failures:
+        preview = "; ".join(failures[:8])
+        if len(failures) > 8:
+            preview += f"; ... ({len(failures)} classes affected)"
+        raise RuntimeError(f"hagrid: {len(failures)} incomplete classes: {preview}")
 
 def download_and_extract_hagrid_annotations(
     url: str,
@@ -778,15 +874,17 @@ def download_gqa(
     viewer_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     if db.success_count("gqa") >= target:
         print(f"gqa: target already reached ({target})")
         return
-    offset = db.get_offset("gqa")
+    offset = scan_offset(db, "gqa")
     known = db.successful_ids("gqa")
     errors = 0
+    consecutive_errors = 0
     while db.success_count("gqa") < target:
-        page_length = min(100, max(1, target - db.success_count("gqa")))
+        page_length = 100
         wrappers = dataset_viewer_rows(
             viewer_url, dataset_name, "train", offset, page_length, timeout
         )
@@ -816,13 +914,18 @@ def download_gqa(
                 item = save_image(image, "gqa", image_id, source_ref, output_dir)
                 db.record_success(item)
                 known.add(image_id)
+                consecutive_errors = 0
                 print(f"gqa: {db.success_count('gqa')}/{target} {image_id}")
             except Exception as exc:
                 db.record_failure("gqa", image_id, source_ref, exc)
                 errors += 1
+                consecutive_errors += 1
                 print(f"gqa: skipped {image_id}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
-                    raise RuntimeError("gqa: maximum error count reached") from exc
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
+                    raise RuntimeError(
+                        f"gqa: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
+                    ) from exc
             finally:
                 db.set_offset("gqa", index + 1)
                 offset = index + 1
@@ -838,15 +941,17 @@ def download_openimages(
     viewer_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     if db.success_count("openimages") >= target:
         print(f"openimages: target already reached ({target})")
         return
-    offset = db.get_offset("openimages")
+    offset = scan_offset(db, "openimages")
     known = db.successful_ids("openimages")
     errors = 0
+    consecutive_errors = 0
     while db.success_count("openimages") < target:
-        page_length = min(100, max(1, target - db.success_count("openimages")))
+        page_length = 100
         wrappers = dataset_viewer_rows(
             viewer_url, dataset_name, "train", offset, page_length, timeout
         )
@@ -873,6 +978,7 @@ def download_openimages(
                 item = save_image(image, "openimages", image_id, url, output_dir)
                 db.record_success(item)
                 known.add(image_id)
+                consecutive_errors = 0
                 print(
                     f"openimages: {db.success_count('openimages')}/{target} "
                     f"{image_id}"
@@ -880,10 +986,12 @@ def download_openimages(
             except Exception as exc:
                 db.record_failure("openimages", image_id, url or "missing-url", exc)
                 errors += 1
+                consecutive_errors += 1
                 print(f"openimages: skipped {image_id}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                     raise RuntimeError(
-                        "openimages: maximum error count reached"
+                        f"openimages: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
                     ) from exc
             finally:
                 db.set_offset("openimages", index + 1)
@@ -891,6 +999,17 @@ def download_openimages(
             if db.success_count("openimages") >= target:
                 return
 
+
+def scan_offset(db: StateDB, dataset: str) -> int:
+    """Rescan historical failures while preserving the high-water mark."""
+    cursor = db.get_offset(dataset)
+    if db.failed_count(dataset) > 0 and cursor > 0:
+        print(
+            f"{dataset}: retrying historical failed rows from offset 0 "
+            f"(cached high-water mark {cursor})"
+        )
+        return 0
+    return cursor
 
 def get_case_insensitive(row: dict[str, str], *names: str) -> str:
     normalized = {key.strip().lower(): value for key, value in row.items() if key}
@@ -961,6 +1080,7 @@ def download_mutual_gaze(
     csv_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     dataset = "mutual_gaze"
     if db.success_count(dataset) >= target:
@@ -972,9 +1092,10 @@ def download_mutual_gaze(
     if not rows:
         raise RuntimeError("mutual_gaze: CSV contains no rows")
 
-    offset = db.get_offset(dataset)
+    offset = scan_offset(db, dataset)
     known = db.successful_ids(dataset)
     errors = 0
+    consecutive_errors = 0
     while offset < len(rows) and db.success_count(dataset) < target:
         row = rows[offset]
         image_id = get_case_insensitive(row, "ImageID", "image_id") or f"row-{offset}"
@@ -991,14 +1112,17 @@ def download_mutual_gaze(
             item = save_image(image, dataset, image_id, source_ref, output_dir)
             db.record_success(item)
             known.add(image_id)
+            consecutive_errors = 0
             print(f"{dataset}: {db.success_count(dataset)}/{target} {image_id}")
         except Exception as exc:
             db.record_failure(dataset, image_id, source_ref, exc)
             errors += 1
+            consecutive_errors += 1
             print(f"{dataset}: skipped {image_id}: {exc}", file=sys.stderr)
-            if errors >= max_errors:
+            if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                 raise RuntimeError(
-                    "mutual_gaze: maximum error count reached"
+                    f"mutual_gaze: download error threshold reached "
+                    f"({errors} total, {consecutive_errors} consecutive)"
                 ) from exc
         finally:
             offset += 1
@@ -1124,7 +1248,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="sources to probe; defaults to all seven",
     )
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--max-errors", type=int, default=20)
+    parser.add_argument(
+        "--max-errors", type=int, default=1000,
+        help="maximum failed images in one source/class (after retries)",
+    )
+    parser.add_argument(
+        "--max-consecutive-errors", type=int, default=15,
+        help="stop a source/class after this many consecutive failed images",
+    )
+    parser.add_argument(
+        "--archive-member-retries", type=int, default=3,
+        help="extra attempts per failed ZIP member, reconnecting between attempts",
+    )
+    parser.add_argument(
+        "--archive-shuffle-block-size", type=int, default=256,
+        help="shuffle physical ZIP blocks of N images; 0 means strictly sequential",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument(
         "--strict",
@@ -1214,6 +1353,10 @@ def run_dataset(
             args.seed,
             archive_url,
             args.max_errors,
+            timeout=args.request_timeout,
+            shuffle_block_size=args.archive_shuffle_block_size,
+            member_retries=args.archive_member_retries,
+            max_consecutive_errors=args.max_consecutive_errors,
         )
     elif dataset == "gqa":
         download_gqa(
@@ -1224,6 +1367,7 @@ def run_dataset(
             args.dataset_viewer_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     elif dataset == "openimages":
         download_openimages(
@@ -1234,6 +1378,7 @@ def run_dataset(
             args.dataset_viewer_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     elif dataset == "mutual_gaze":
         download_mutual_gaze(
@@ -1243,6 +1388,7 @@ def run_dataset(
             args.mutual_gaze_csv_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     else:
         raise AssertionError(f"unsupported dataset: {dataset}")
@@ -1259,6 +1405,12 @@ def main() -> int:
         raise SystemExit("--hagrid-limit-per-gesture must be at least 1")
     if args.max_errors < 1:
         raise SystemExit("--max-errors must be at least 1")
+    if args.max_consecutive_errors < 1:
+        raise SystemExit("--max-consecutive-errors must be at least 1")
+    if args.archive_member_retries < 0:
+        raise SystemExit("--archive-member-retries cannot be negative")
+    if args.archive_shuffle_block_size < 0:
+        raise SystemExit("--archive-shuffle-block-size cannot be negative")
     if args.request_timeout <= 0:
         raise SystemExit("--request-timeout must be positive")
 
@@ -1316,7 +1468,7 @@ def main() -> int:
                 else:
                     after = db.success_count(dataset)
                 detail = f"{type(exc).__name__}: {exc}"
-                state = "manual_required"
+                state = "partial" if after else "failed"
                 manual_sources.append(dataset)
                 note = write_manual_note(dataset, output_dir, detail)
                 print(f"MANUAL: {dataset}: {detail}", file=sys.stderr)
