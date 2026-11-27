@@ -874,13 +874,15 @@ def download_gqa(
     viewer_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     if db.success_count("gqa") >= target:
         print(f"gqa: target already reached ({target})")
         return
-    offset = db.get_offset("gqa")
+    offset = scan_offset(db, "gqa")
     known = db.successful_ids("gqa")
     errors = 0
+    consecutive_errors = 0
     while db.success_count("gqa") < target:
         page_length = min(100, max(1, target - db.success_count("gqa")))
         wrappers = dataset_viewer_rows(
@@ -912,13 +914,18 @@ def download_gqa(
                 item = save_image(image, "gqa", image_id, source_ref, output_dir)
                 db.record_success(item)
                 known.add(image_id)
+                consecutive_errors = 0
                 print(f"gqa: {db.success_count('gqa')}/{target} {image_id}")
             except Exception as exc:
                 db.record_failure("gqa", image_id, source_ref, exc)
                 errors += 1
+                consecutive_errors += 1
                 print(f"gqa: skipped {image_id}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
-                    raise RuntimeError("gqa: maximum error count reached") from exc
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
+                    raise RuntimeError(
+                        f"gqa: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
+                    ) from exc
             finally:
                 db.set_offset("gqa", index + 1)
                 offset = index + 1
@@ -934,13 +941,15 @@ def download_openimages(
     viewer_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     if db.success_count("openimages") >= target:
         print(f"openimages: target already reached ({target})")
         return
-    offset = db.get_offset("openimages")
+    offset = scan_offset(db, "openimages")
     known = db.successful_ids("openimages")
     errors = 0
+    consecutive_errors = 0
     while db.success_count("openimages") < target:
         page_length = min(100, max(1, target - db.success_count("openimages")))
         wrappers = dataset_viewer_rows(
@@ -969,6 +978,7 @@ def download_openimages(
                 item = save_image(image, "openimages", image_id, url, output_dir)
                 db.record_success(item)
                 known.add(image_id)
+                consecutive_errors = 0
                 print(
                     f"openimages: {db.success_count('openimages')}/{target} "
                     f"{image_id}"
@@ -976,10 +986,12 @@ def download_openimages(
             except Exception as exc:
                 db.record_failure("openimages", image_id, url or "missing-url", exc)
                 errors += 1
+                consecutive_errors += 1
                 print(f"openimages: skipped {image_id}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                     raise RuntimeError(
-                        "openimages: maximum error count reached"
+                        f"openimages: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
                     ) from exc
             finally:
                 db.set_offset("openimages", index + 1)
@@ -987,6 +999,17 @@ def download_openimages(
             if db.success_count("openimages") >= target:
                 return
 
+
+def scan_offset(db: StateDB, dataset: str) -> int:
+    """Rescan historical failures while preserving the high-water mark."""
+    cursor = db.get_offset(dataset)
+    if db.failed_count(dataset) > 0 and cursor > 0:
+        print(
+            f"{dataset}: retrying historical failed rows from offset 0 "
+            f"(cached high-water mark {cursor})"
+        )
+        return 0
+    return cursor
 
 def get_case_insensitive(row: dict[str, str], *names: str) -> str:
     normalized = {key.strip().lower(): value for key, value in row.items() if key}
@@ -1057,6 +1080,7 @@ def download_mutual_gaze(
     csv_url: str,
     timeout: float,
     max_errors: int,
+    max_consecutive_errors: int,
 ) -> None:
     dataset = "mutual_gaze"
     if db.success_count(dataset) >= target:
@@ -1068,9 +1092,10 @@ def download_mutual_gaze(
     if not rows:
         raise RuntimeError("mutual_gaze: CSV contains no rows")
 
-    offset = db.get_offset(dataset)
+    offset = scan_offset(db, dataset)
     known = db.successful_ids(dataset)
     errors = 0
+    consecutive_errors = 0
     while offset < len(rows) and db.success_count(dataset) < target:
         row = rows[offset]
         image_id = get_case_insensitive(row, "ImageID", "image_id") or f"row-{offset}"
@@ -1087,14 +1112,17 @@ def download_mutual_gaze(
             item = save_image(image, dataset, image_id, source_ref, output_dir)
             db.record_success(item)
             known.add(image_id)
+            consecutive_errors = 0
             print(f"{dataset}: {db.success_count(dataset)}/{target} {image_id}")
         except Exception as exc:
             db.record_failure(dataset, image_id, source_ref, exc)
             errors += 1
+            consecutive_errors += 1
             print(f"{dataset}: skipped {image_id}: {exc}", file=sys.stderr)
-            if errors >= max_errors:
+            if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                 raise RuntimeError(
-                    "mutual_gaze: maximum error count reached"
+                    f"mutual_gaze: download error threshold reached "
+                    f"({errors} total, {consecutive_errors} consecutive)"
                 ) from exc
         finally:
             offset += 1
