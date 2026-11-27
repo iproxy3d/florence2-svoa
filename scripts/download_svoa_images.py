@@ -884,7 +884,7 @@ def download_gqa(
     errors = 0
     consecutive_errors = 0
     while db.success_count("gqa") < target:
-        page_length = min(100, max(1, target - db.success_count("gqa")))
+        page_length = 100
         wrappers = dataset_viewer_rows(
             viewer_url, dataset_name, "train", offset, page_length, timeout
         )
@@ -951,7 +951,7 @@ def download_openimages(
     errors = 0
     consecutive_errors = 0
     while db.success_count("openimages") < target:
-        page_length = min(100, max(1, target - db.success_count("openimages")))
+        page_length = 100
         wrappers = dataset_viewer_rows(
             viewer_url, dataset_name, "train", offset, page_length, timeout
         )
