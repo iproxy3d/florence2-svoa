@@ -789,78 +789,45 @@ def download_hagrid(
     db: StateDB,
     output_dir: Path,
 ) -> None:
-    """Download an equal, resumable sample from selected HaGRID classes."""
-
-    try:
-        from remotezip import RemoteZip
-    except ImportError as exc:
-        raise RuntimeError(
-            'missing dependency: install it with `python -m pip install '
-            '"remotezip>=0.12"`'
-        ) from exc
-
+    """Download each HaGRID class independently; one failed class cannot stop others."""
     target = args.hagrid_limit_per_gesture or args.limit_per_dataset
     known = db.successful_ids("hagrid")
+    failures: list[str] = []
     for gesture in args.hagrid_gestures:
         current = hagrid_success_count(db, gesture)
         if current >= target:
             print(f"hagrid/{gesture}: target already reached ({target})")
             continue
-
         archive_url = hagrid_archive_url(args, gesture)
-        errors = 0
-        archive = RemoteZip(archive_url)
         try:
-            members = shuffled_image_members(
-                (info.filename for info in archive.infolist()),
+            download_remote_zip(
+                "hagrid",
+                db,
+                output_dir,
+                target,
                 dataset_seed(args.seed, f"hagrid/{gesture}"),
+                archive_url,
+                args.max_errors,
+                timeout=args.request_timeout,
+                shuffle_block_size=args.archive_shuffle_block_size,
+                member_retries=args.archive_member_retries,
+                max_consecutive_errors=args.max_consecutive_errors,
+                image_prefix=f"{gesture}/",
+                initial_count=current,
+                known=known,
             )
-            if not members:
-                raise RuntimeError(
-                    f"HaGRID archive {gesture!r} contains no supported images"
-                )
-            for member in members:
-                image_id = f"{gesture}/{member}"
-                if image_id in known:
-                    continue
-                source_ref = f"{archive_url}#{member}"
-                try:
-                    with archive.open(member) as source:
-                        image = Image.open(BytesIO(source.read()))
-                        item = save_image(
-                            image,
-                            "hagrid",
-                            image_id,
-                            source_ref,
-                            output_dir,
-                        )
-                    db.record_success(item)
-                    known.add(image_id)
-                    current = hagrid_success_count(db, gesture)
-                    print(f"hagrid/{gesture}: {current}/{target} {member}")
-                except Exception as exc:
-                    db.record_failure("hagrid", image_id, source_ref, exc)
-                    errors += 1
-                    print(
-                        f"hagrid/{gesture}: skipped {member}: {exc}",
-                        file=sys.stderr,
-                    )
-                    if errors >= args.max_errors:
-                        raise RuntimeError(
-                            f"hagrid/{gesture}: maximum error count reached"
-                        ) from exc
-                if hagrid_success_count(db, gesture) >= target:
-                    break
-        finally:
-            archive.close()
-
-        current = hagrid_success_count(db, gesture)
-        if current < target:
-            raise RuntimeError(
-                f"hagrid/{gesture}: archive ended before target {target}; "
-                f"only {current} images are available locally"
+        except Exception as exc:
+            detail = f"{gesture}: {type(exc).__name__}: {exc}"
+            failures.append(detail)
+            print(
+                f"hagrid: incomplete {detail}; continuing with next class",
+                file=sys.stderr,
             )
-
+    if failures:
+        preview = "; ".join(failures[:8])
+        if len(failures) > 8:
+            preview += f"; ... ({len(failures)} classes affected)"
+        raise RuntimeError(f"hagrid: {len(failures)} incomplete classes: {preview}")
 
 def download_and_extract_hagrid_annotations(
     url: str,
@@ -1253,7 +1220,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="sources to probe; defaults to all seven",
     )
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--max-errors", type=int, default=20)
+    parser.add_argument(
+        "--max-errors", type=int, default=1000,
+        help="maximum failed images in one source/class (after retries)",
+    )
+    parser.add_argument(
+        "--max-consecutive-errors", type=int, default=15,
+        help="stop a source/class after this many consecutive failed images",
+    )
+    parser.add_argument(
+        "--archive-member-retries", type=int, default=3,
+        help="extra attempts per failed ZIP member, reconnecting between attempts",
+    )
+    parser.add_argument(
+        "--archive-shuffle-block-size", type=int, default=256,
+        help="shuffle physical ZIP blocks of N images; 0 means strictly sequential",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument(
         "--strict",
@@ -1343,6 +1325,10 @@ def run_dataset(
             args.seed,
             archive_url,
             args.max_errors,
+            timeout=args.request_timeout,
+            shuffle_block_size=args.archive_shuffle_block_size,
+            member_retries=args.archive_member_retries,
+            max_consecutive_errors=args.max_consecutive_errors,
         )
     elif dataset == "gqa":
         download_gqa(
@@ -1353,6 +1339,7 @@ def run_dataset(
             args.dataset_viewer_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     elif dataset == "openimages":
         download_openimages(
@@ -1363,6 +1350,7 @@ def run_dataset(
             args.dataset_viewer_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     elif dataset == "mutual_gaze":
         download_mutual_gaze(
@@ -1372,6 +1360,7 @@ def run_dataset(
             args.mutual_gaze_csv_url,
             args.request_timeout,
             args.max_errors,
+            args.max_consecutive_errors,
         )
     else:
         raise AssertionError(f"unsupported dataset: {dataset}")
@@ -1388,6 +1377,12 @@ def main() -> int:
         raise SystemExit("--hagrid-limit-per-gesture must be at least 1")
     if args.max_errors < 1:
         raise SystemExit("--max-errors must be at least 1")
+    if args.max_consecutive_errors < 1:
+        raise SystemExit("--max-consecutive-errors must be at least 1")
+    if args.archive_member_retries < 0:
+        raise SystemExit("--archive-member-retries cannot be negative")
+    if args.archive_shuffle_block_size < 0:
+        raise SystemExit("--archive-shuffle-block-size cannot be negative")
     if args.request_timeout <= 0:
         raise SystemExit("--request-timeout must be positive")
 
@@ -1445,7 +1440,7 @@ def main() -> int:
                 else:
                     after = db.success_count(dataset)
                 detail = f"{type(exc).__name__}: {exc}"
-                state = "manual_required"
+                state = "partial" if after else "failed"
                 manual_sources.append(dataset)
                 note = write_manual_note(dataset, output_dir, detail)
                 print(f"MANUAL: {dataset}: {detail}", file=sys.stderr)
