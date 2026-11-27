@@ -13,7 +13,8 @@ are handled in one of two ways:
 
 * individual images are requested by URL/ID (GQA, Open Images, Mutual Gaze);
 * selected members are read from a remote ZIP with HTTP Range requests
-  (SWiG, EasyPortrait, WIDER FACE, HaGRIDv2).
+  (SWiG, EasyPortrait, WIDER FACE, HaGRIDv2). ZIP members are processed
+  in physical order or shuffled in contiguous blocks instead of per file.
 
 If selective access is unavailable, the dataset directory is still created
 and receives ``_PLACE_IMAGES_HERE.txt``. Images can be copied there manually
@@ -293,6 +294,14 @@ class StateDB:
         )
         return {Path(str(row["local_path"])).resolve() for row in rows}
 
+    def failed_count(self, dataset: str) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM downloads "
+            "WHERE dataset = ? AND status = 'failed'",
+            (dataset,),
+        ).fetchone()
+        return int(row["count"])
+
     def get_offset(self, dataset: str) -> int:
         row = self.connection.execute(
             "SELECT value FROM metadata WHERE key = ?",
@@ -303,7 +312,8 @@ class StateDB:
     def set_offset(self, dataset: str, value: int) -> None:
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+            "WHERE CAST(excluded.value AS INTEGER) > CAST(metadata.value AS INTEGER)",
             (f"{dataset}.next_offset", str(value)),
         )
         self.connection.commit()
@@ -546,15 +556,105 @@ def fetch_remote_image(url: str, timeout: float, attempts: int = 3) -> Image.Ima
     raise RuntimeError(f"cannot download image after {attempts} attempts")
 
 
-def shuffled_image_members(names: Iterable[str], seed: int) -> list[str]:
+def ordered_image_members(
+    infos: Iterable[zipfile.ZipInfo], seed: int, block_size: int
+) -> list[zipfile.ZipInfo]:
+    """Visit neighboring ZIP entries together, optionally shuffle whole blocks.
+
+    Each entry is ordered by its physical ZIP header offset, which may differ
+    from the listing order. A block size of 0 disables all shuffling.
+    """
     images = [
-        name
-        for name in names
-        if not name.endswith("/") and Path(name).suffix.lower() in IMAGE_SUFFIXES
+        info for info in infos
+        if not info.filename.endswith("/")
+        and Path(info.filename).suffix.lower() in IMAGE_SUFFIXES
     ]
-    randomizer = random.Random(seed)
-    randomizer.shuffle(images)
-    return images
+    images.sort(key=lambda info: (info.header_offset, info.filename))
+    if block_size <= 0:
+        return images
+    blocks = [
+        images[index:index + block_size]
+        for index in range(0, len(images), block_size)
+    ]
+    random.Random(seed).shuffle(blocks)
+    return [info for block in blocks for info in block]
+
+
+def retrying_zip_session():
+    """Give RemoteZip HTTP retries for 429, 5xx and transient connections."""
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    policy = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.headers.update(request_headers("application/zip"))
+    adapter = HTTPAdapter(max_retries=policy, pool_connections=1, pool_maxsize=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def retryable_zip_error(exc: Exception) -> bool:
+    """Avoid repeatedly requesting bad images and permanently missing URLs."""
+    if isinstance(exc, (ValueError, Image.UnidentifiedImageError)):
+        return False
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return status in (408, 429) or 500 <= status <= 599
+    description = str(exc).lower()
+    if any(token in description for token in (
+        "range not supported", "range requests", "http 403", "http 404",
+        "403 client error", "404 client error",
+    )):
+        return False
+    return True
+
+
+def open_remote_archive(
+    archive_url: str, timeout: float, attempts: int = 3
+):
+    """Return a RemoteZip and its owning HTTP session; retry initial probes."""
+    try:
+        from remotezip import RemoteZip
+    except ImportError as exc:
+        raise RuntimeError(
+            'missing dependency: install it with remotezip>=0.12'
+        ) from exc
+
+    for attempt in range(attempts):
+        session = retrying_zip_session()
+        try:
+            archive = RemoteZip(
+                archive_url, session=session, timeout=timeout,
+                initial_buffer_size=1024 * 1024,
+            )
+            return archive, session
+        except Exception as exc:
+            session.close()
+            if attempt + 1 >= attempts or not retryable_zip_error(exc):
+                raise
+            time.sleep(retry_delay(attempt))
+    raise RuntimeError(f"cannot open ZIP archive {archive_url}")
+
+
+def close_remote_archive(archive, session) -> None:
+    try:
+        if archive is not None:
+            archive.close()
+    finally:
+        if session is not None:
+            session.close()
 
 
 def download_remote_zip(
@@ -565,59 +665,88 @@ def download_remote_zip(
     seed: int,
     archive_url: str,
     max_errors: int,
+    *,
+    timeout: float = 60.0,
+    shuffle_block_size: int = 256,
+    member_retries: int = 3,
+    max_consecutive_errors: int = 15,
+    image_prefix: str = "",
+    initial_count: int | None = None,
+    known: set[str] | None = None,
 ) -> None:
-    if db.success_count(dataset) >= target:
-        print(f"{dataset}: target already reached ({target})")
+    """Download ZIP members with bounded remote seeks and resilient retries."""
+    count = db.success_count(dataset) if initial_count is None else initial_count
+    if count >= target:
+        print(f"{dataset}/{image_prefix}: target already reached ({target})")
         return
-    try:
-        from remotezip import RemoteZip
-    except ImportError as exc:
-        raise RuntimeError(
-            'missing dependency: install it with `python -m pip install "remotezip>=0.12"`'
-        ) from exc
+    if known is None:
+        known = db.successful_ids(dataset)
 
-    known = db.successful_ids(dataset)
+    archive, session = open_remote_archive(archive_url, timeout)
     errors = 0
-    archive = RemoteZip(archive_url)
+    consecutive_errors = 0
     try:
-        members = shuffled_image_members(
-            (info.filename for info in archive.infolist()),
-            dataset_seed(seed, dataset),
+        members = ordered_image_members(
+            archive.infolist(), seed, shuffle_block_size,
         )
         if not members:
             raise RuntimeError("remote ZIP contains no supported image files")
         for member in members:
-            image_id = member
+            image_id = f"{image_prefix}{member.filename}"
             if image_id in known:
                 continue
-            source_ref = f"{archive_url}#{member}"
-            try:
-                with archive.open(member) as source:
-                    image = Image.open(BytesIO(source.read()))
-                    item = save_image(
-                        image, dataset, image_id, source_ref, output_dir
+            source_ref = f"{archive_url}#{member.filename}"
+            last_error = None
+
+            for attempt in range(member_retries + 1):
+                try:
+                    with archive.open(member.filename) as source:
+                        with Image.open(BytesIO(source.read())) as image:
+                            item = save_image(
+                                image, dataset, image_id, source_ref, output_dir
+                            )
+                    db.record_success(item)
+                    known.add(image_id)
+                    count += 1
+                    consecutive_errors = 0
+                    print(f"{dataset}: {count}/{target} {image_id}")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= member_retries or not retryable_zip_error(exc):
+                        break
+                    print(
+                        f"{dataset}: retry {attempt + 1}/{member_retries} "
+                        f"{image_id}: {exc}", file=sys.stderr,
                     )
-                db.record_success(item)
-                known.add(image_id)
-                print(f"{dataset}: {db.success_count(dataset)}/{target} {member}")
-            except Exception as exc:
-                db.record_failure(dataset, image_id, source_ref, exc)
+                    time.sleep(retry_delay(attempt))
+                    close_remote_archive(archive, session)
+                    archive, session = None, None
+                    archive, session = open_remote_archive(archive_url, timeout)
+
+            if last_error is not None and image_id not in known:
+                db.record_failure(dataset, image_id, source_ref, last_error)
                 errors += 1
-                print(f"{dataset}: skipped {member}: {exc}", file=sys.stderr)
-                if errors >= max_errors:
+                consecutive_errors += 1
+                print(
+                    f"{dataset}: skipped {image_id}: {last_error}",
+                    file=sys.stderr,
+                )
+                if errors >= max_errors or consecutive_errors >= max_consecutive_errors:
                     raise RuntimeError(
-                        f"{dataset}: maximum error count reached"
-                    ) from exc
-            if db.success_count(dataset) >= target:
+                        f"{dataset}: download error threshold reached "
+                        f"({errors} total, {consecutive_errors} consecutive)"
+                    ) from last_error
+
+            if count >= target:
                 return
     finally:
-        archive.close()
+        close_remote_archive(archive, session)
 
     raise RuntimeError(
         f"{dataset}: archive ended before target {target}; "
-        f"only {db.success_count(dataset)} images are available locally"
+        f"only {count} images are available locally"
     )
-
 
 def hagrid_success_count(db: StateDB, gesture: str) -> int:
     """Return the number of downloaded HaGRID images for one gesture."""
